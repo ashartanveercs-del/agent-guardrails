@@ -52,19 +52,23 @@ def main() -> int:
     missed = 0
     for label, relative, original, weakened in MUTATIONS:
         path = ROOT / relative
-        source = path.read_text(encoding="utf-8")
-        if original not in source:
+        raw = path.read_bytes()                     # restored byte-for-byte afterwards
+        source = raw.decode("utf-8")
+        newline = "\r\n" if "\r\n" in source else "\n"
+        text = source.replace("\r\n", "\n")
+        if original not in text:
             print(f"[STALE ] {label}: the guarded line moved; update this script")
             missed += 1
             continue
         try:
-            path.write_text(source.replace(original, weakened, 1), encoding="utf-8")
+            mutated = text.replace(original, weakened, 1).replace("\n", newline)
+            path.write_bytes(mutated.encode("utf-8"))
             proc = subprocess.run(  # noqa: S603 - fixed argv: this interpreter running pytest
                 [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
                  "tests/redteam", "tests/test_tenancy.py"],
                 cwd=ROOT, capture_output=True, text=True, timeout=600, check=False)
         finally:
-            path.write_text(source, encoding="utf-8")
+            path.write_bytes(raw)
         caught = proc.returncode != 0
         missed += not caught
         first = next((ln for ln in proc.stdout.splitlines() if ln.startswith("FAILED")), "")
