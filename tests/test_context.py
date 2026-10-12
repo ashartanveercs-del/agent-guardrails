@@ -2,18 +2,26 @@
 
 import asyncio
 import threading
+from datetime import timedelta
 
 import pytest
 
-from agent_guardrails.context import current_turn, mark_untrusted, tainted_by, turn_scope
-from agent_guardrails.errors import Refused
+from agent_guardrails.context import (
+    TaintLedger,
+    current_turn,
+    mark_untrusted,
+    tainted_by,
+    turn_scope,
+)
+from agent_guardrails.errors import Refused, StateCorrupt
 from agent_guardrails.identity import Envelope, OwnerIdentity, Role, SystemOrigin, classify_turn
+from tests.fakes import FakeClock
 
 OWNERS = OwnerIdentity(phones=["+15550001111"])
 
 
-def owner_turn():
-    return classify_turn(Envelope("sms", "+15550001111", verified=True), OWNERS)
+def owner_turn(channel="sms"):
+    return classify_turn(Envelope(channel, "+15550001111", verified=True), OWNERS)
 
 
 def stranger_turn():
@@ -55,6 +63,88 @@ def test_taint_starts_clean_accumulates_and_is_per_scope():
 def test_marking_taint_outside_a_turn_is_refused():
     with pytest.raises(Refused):
         mark_untrusted("email")
+
+
+def test_a_scope_can_start_with_taint_carried_over_from_earlier_turns():
+    with turn_scope(owner_turn(), taint={"email"}):
+        assert tainted_by() == {"email"}
+        mark_untrusted("web")
+        assert tainted_by() == {"email", "web"}
+    with turn_scope(owner_turn(), taint="email"):           # one name, not five letters
+        assert tainted_by() == {"email"}
+
+
+# -- the taint ledger ------------------------------------------------------------------------
+
+def make_ledger(hours=2):
+    clock = FakeClock()
+    return TaintLedger(ttl=timedelta(hours=hours), clock=clock), clock
+
+
+def test_the_ledger_carries_taint_into_later_turns_of_the_same_conversation():
+    ledger, clock = make_ledger()
+    assert ledger.carried(owner_turn()) == frozenset()
+    ledger.remember(owner_turn(), {"email"})
+    assert ledger.carried(owner_turn()) == {"email"}                # a later message
+    assert ledger.carried(owner_turn("whatsapp")) == frozenset()     # another conversation
+    clock.advance(hours=2)
+    assert ledger.carried(owner_turn()) == frozenset()              # aged out of the history
+
+
+def test_new_taint_merges_and_restarts_the_clock():
+    ledger, clock = make_ledger()
+    ledger.remember(owner_turn(), {"email"})
+    clock.advance(hours=1)
+    ledger.remember(owner_turn(), {"web"})
+    clock.advance(hours=1, minutes=30)
+    assert ledger.carried(owner_turn()) == {"email", "web"}
+    ledger.remember(owner_turn(), ())                               # a clean turn changes nothing
+    assert ledger.carried(owner_turn()) == {"email", "web"}
+
+
+def test_forgetting_a_conversation_clears_it():
+    ledger, _ = make_ledger()
+    ledger.remember(owner_turn(), {"email"})
+    ledger.forget(owner_turn())
+    assert ledger.carried(owner_turn()) == frozenset()
+
+
+def test_system_jobs_are_conversations_and_third_parties_are_not_kept():
+    ledger, _ = make_ledger()
+    digest = classify_turn(SystemOrigin("digest"), OWNERS)
+    ledger.remember(digest, {"rss"})
+    ledger.remember(stranger_turn(), {"web"})
+    assert ledger.carried(classify_turn(SystemOrigin("digest"), OWNERS)) == {"rss"}
+    assert ledger.carried(classify_turn(SystemOrigin("backup"), OWNERS)) == frozenset()
+    assert ledger.carried(stranger_turn()) == frozenset()
+
+
+def test_the_ledger_needs_a_positive_ttl():
+    with pytest.raises(ValueError):
+        make_ledger(hours=0)
+
+
+def test_a_file_backed_ledger_is_shared_by_every_worker(tmp_path):
+    """Consecutive messages may land on different gateway processes; the taint must too."""
+    clock = FakeClock()
+    path = tmp_path / "taint.json"
+    first = TaintLedger(path, ttl=timedelta(hours=2), clock=clock)
+    second = TaintLedger(path, ttl=timedelta(hours=2), clock=clock)
+    first.remember(owner_turn(), {"email"})
+    assert second.carried(owner_turn()) == {"email"}
+    second.remember(owner_turn(), {"web"})
+    assert first.carried(owner_turn()) == {"email", "web"}
+    first.forget(owner_turn())
+    assert second.carried(owner_turn()) == frozenset()
+
+
+@pytest.mark.parametrize("content", ["{ truncated", "[]", '{"conversations": 3}'])
+def test_a_corrupt_ledger_file_fails_loudly(tmp_path, content):
+    """Starting empty would quietly declare every conversation clean."""
+    path = tmp_path / "taint.json"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(StateCorrupt):
+        TaintLedger(path).carried(owner_turn())
 
 
 async def test_the_turn_and_its_taint_flow_into_child_tasks():

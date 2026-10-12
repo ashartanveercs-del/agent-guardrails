@@ -8,41 +8,50 @@ or a third party who has seen the code, has no path to approval.
 
 Further guarantees:
 
-* **Bound to content.** Each request stores a SHA-256 digest of its action and payload.
-  The digest is re-checked before execution, so a payload edited in the store is never
-  run. An owner edit issues a *new* code, so an approval can't apply to text the owner
-  hasn't seen.
+* **Bound to content.** Each request carries an HMAC-SHA256 digest of its code, action and
+  payload, keyed with a secret that is not stored with the requests. It is re-checked
+  before execution, so a payload edited in the store, or moved there from another request,
+  is never run, even by someone who can rewrite the whole store. An owner edit issues a
+  *new* code, so an approval can't apply to text the owner hasn't seen.
 * **A separate turn.** A request can't be decided in the turn that created it.
-* **At most once.** A request is marked ``executing`` and saved *before* the side effect.
-  A crash mid-send leaves it ``executing`` and it is never retried automatically -
-  re-sending a message is worse than asking again.
+* **At most once.** A request is marked ``executing`` and saved *before* the side effect,
+  inside the store's lock; :class:`JsonApprovalStore` takes an OS file lock, so two worker
+  processes sharing it can't both claim one approval. A crash mid-send leaves it
+  ``executing`` and it is never retried automatically - re-sending a message is worse than
+  asking again.
 * **Bounded.** Requests expire (24 h by default); a third party may only have a few
-  pending at once; identical pending requests are de-duplicated.
-* **Unambiguous.** "do not approve 7KQ2", "approve 7KQ2?" or "yes 7KQ2 no wait" do nothing.
+  pending at once (unverified senders all share one quota, since their ids may be spoofed);
+  identical pending requests are de-duplicated.
+* **Unambiguous.** Only an exact verb and code decides. "approve 7KQ2" or "7KQ2 yes" runs
+  it; "never send 7KQ2", "don't send 7KQ2", "approve 7KQ2?" or "yes 7KQ2 no wait" do nothing.
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import functools
 import hashlib
+import hmac
 import inspect
 import json
 import logging
 import re
 import secrets
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol
 
 from .context import current_turn, tainted_by
-from .errors import Refused
-from .gates import bind_arguments
+from .errors import ConfigError, Refused
+from .gates import APPROVAL_POLICY_ATTR, bind_arguments
 from .identity import Role, TurnContext
-from .storage import JsonFile
+from .sealing import MIN_KEY_BYTES
+from .storage import FileLock, JsonFile
 
 log = logging.getLogger(__name__)
 
@@ -51,13 +60,17 @@ _CODE_RE = re.compile(r"[2-9A-HJKMNP-Z]{4}")
 _ACTION_RE = re.compile(r"[a-z0-9][a-z0-9._\-]{0,63}")
 MAX_PAYLOAD_BYTES = 16_384
 MAX_SUMMARY_CHARS = 300
+_DIGEST_CONTEXT = b"agent-guardrails approval v1\n"
 
 APPROVE_WORDS = frozenset({"approve", "approved", "yes", "y", "ok", "okay", "confirm",
                            "confirmed", "send", "go", "do"})
 REJECT_WORDS = frozenset({"reject", "rejected", "no", "n", "deny", "denied", "cancel",
-                          "decline", "stop", "dont", "don't"})
-HEDGE_WORDS = frozenset({"not", "wait", "hold", "maybe", "later", "unsure", "unless", "but",
-                         "if"})
+                          "decline", "stop", "dont", "don't", "never", "nope", "nah"})
+# Phones type curly quotes by default; mapped to ASCII, a curly "don't" stays one word.
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "ʼ": "'", "“": '"',
+                         "”": '"'})
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)*")
+_BETWEEN_WORDS_RE = re.compile(r"""[\s.,!:;'"]*""")        # light punctuation; never "?"
 
 
 class ApprovalStatus(StrEnum):
@@ -73,10 +86,13 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-def payload_digest(action: str, payload: Mapping[str, Any]) -> str:
-    """SHA-256 over the canonical JSON of the action and its payload."""
-    blob = _canonical_json({"action": action, "payload": payload}).encode("utf-8")
-    return hashlib.sha256(blob).hexdigest()
+def _content(action: str, payload: Mapping[str, Any]) -> str:
+    """The canonical text of a request: what de-duplication compares."""
+    return _canonical_json({"action": action, "payload": payload})
+
+
+def _same_digest(expected: str, stored: object) -> bool:
+    return isinstance(stored, str) and stored.isascii() and hmac.compare_digest(expected, stored)
 
 
 def _clean_summary(text: str) -> str:
@@ -103,22 +119,50 @@ def _random_code() -> str:
 
 def parse_decision(text: str, known_codes: Iterable[str]) -> tuple[str | None, list[str]]:
     """Read an owner's reply. Returns ``(verb, codes)`` where verb is ``"approve"``,
-    ``"reject"`` or ``None`` (no clear instruction). Only known codes are returned."""
-    known = set(known_codes)
-    tokens = re.findall(r"[A-Za-z0-9']+", text or "")
+    ``"reject"`` or ``None`` (no clear instruction). Only known codes are returned.
+
+    The grammar is an allowlist, because refusals can't be listed: "never send 7KQ2",
+    "don't send 7KQ2" and "send 7KQ2 to the trash" all contain an approving word. A reply
+    decides only when it is exactly one word from :data:`APPROVE_WORDS` or
+    :data:`REJECT_WORDS` before or after its codes (separated by spaces, commas or "and"),
+    with nothing around them but light punctuation. Anything else, a question mark
+    included, is ambiguous and decides nothing."""
+    known = {code.upper() for code in known_codes}
+    normal = (text or "").translate(_QUOTES)
+    words = _WORD_RE.findall(normal)
     codes: list[str] = []
-    for token in tokens:
-        upper = token.upper()
-        if upper in known and upper not in codes:
-            codes.append(upper)
+    for word in words:
+        if word.upper() in known and word.upper() not in codes:
+            codes.append(word.upper())
     if not codes:
         return None, []
-    words = {t.lower() for t in tokens}
-    approve, reject = bool(words & APPROVE_WORDS), bool(words & REJECT_WORDS)
-    hedged = bool(words & HEDGE_WORDS) or "?" in (text or "")
-    if hedged or approve == reject:
-        return None, codes
-    return ("approve" if approve else "reject"), codes
+    return _strict_verb(normal, words, known), codes
+
+
+def _strict_verb(text: str, words: list[str], known: set[str]) -> str | None:
+    if not all(_BETWEEN_WORDS_RE.fullmatch(gap) for gap in _WORD_RE.split(text)):
+        return None
+    kinds: list[str] = []
+    for word in words:
+        lower = word.lower()
+        if word.upper() in known:
+            kinds.append("code")
+        elif lower == "and":
+            kinds.append("and")
+        elif lower in APPROVE_WORDS:
+            kinds.append("approve")
+        elif lower in REJECT_WORDS:
+            kinds.append("reject")
+        else:
+            return None                        # any other word may change the meaning
+    verbs = [i for i, kind in enumerate(kinds) if kind in ("approve", "reject")]
+    if len(verbs) != 1 or verbs[0] not in (0, len(kinds) - 1):
+        return None
+    rest = kinds[1:] if verbs[0] == 0 else kinds[:-1]      # codes, joined by "and" or not
+    if not rest or rest[0] != "code" or rest[-1] != "code" or any(
+            a == b == "and" for a, b in zip(rest, rest[1:], strict=False)):
+        return None
+    return kinds[verbs[0]]
 
 
 @dataclass
@@ -179,16 +223,29 @@ class Decision:
 # -- stores ------------------------------------------------------------------------------------
 
 class ApprovalStore(Protocol):
+    """Where requests live. ``lock()`` must keep every other user of the same store out - in
+    this process and in any other - while the queue reads, changes and saves it.
+    ``persistent`` stores outlive the process, so the queue insists on a stable key."""
+
+    persistent: bool
+
+    def lock(self) -> AbstractContextManager[object]: ...
     def load(self) -> dict[str, Approval]: ...
     def save(self, approvals: Mapping[str, Approval]) -> None: ...
 
 
 class MemoryApprovalStore:
     """Keeps serialised copies, so code that mutates a loaded object without saving it
-    behaves exactly as it would against a file."""
+    behaves exactly as it would against a file. It lives in one process, where the queue's
+    own lock already serialises access."""
+
+    persistent = False
 
     def __init__(self) -> None:
         self._data: dict[str, dict[str, Any]] = {}
+
+    def lock(self) -> AbstractContextManager[object]:
+        return contextlib.nullcontext()
 
     def load(self) -> dict[str, Approval]:
         return {code: Approval.from_json(copy.deepcopy(d)) for code, d in self._data.items()}
@@ -198,29 +255,53 @@ class MemoryApprovalStore:
 
 
 class JsonApprovalStore:
+    """Requests in a JSON file that several worker processes on one machine may share: each
+    load and save, and each read-modify-write the queue makes, holds an OS lock on a
+    ``<file>.lock`` beside it."""
+
+    persistent = True
+
     def __init__(self, path: str) -> None:
         self._file = JsonFile(path)
+        self._lock = FileLock(self._file.path.with_name(self._file.path.name + ".lock"))
+
+    def lock(self) -> FileLock:
+        return self._lock
 
     def load(self) -> dict[str, Approval]:
-        data = self._file.read({"version": 1, "approvals": []})
+        with self._lock:
+            data = self._file.read({"version": 1, "approvals": []})
         return {d["code"]: Approval.from_json(d) for d in data.get("approvals", [])}
 
     def save(self, approvals: Mapping[str, Approval]) -> None:
-        self._file.write({"version": 1,
-                          "approvals": [a.to_json() for a in approvals.values()]})
+        with self._lock:
+            self._file.write({"version": 1,
+                              "approvals": [a.to_json() for a in approvals.values()]})
 
 
 # -- the queue ---------------------------------------------------------------------------------
 
 class ApprovalQueue:
-    def __init__(self, store: ApprovalStore | None = None, *,
+    def __init__(self, store: ApprovalStore | None = None, *, key: bytes | None = None,
                  ttl: timedelta = timedelta(hours=24),
                  clock: Callable[[], datetime] | None = None,
                  notify: Callable[[Approval], None] | None = None,
                  max_pending_per_requester: int = 3,
                  retention: timedelta = timedelta(days=30),
                  code_factory: Callable[[], str] | None = None) -> None:
+        """``key`` signs every request (see "Bound to content" above). Keep it secret,
+        outside the store, and stable across restarts: requests signed with another key are
+        never run. In-memory stores may omit it and get a random key per queue."""
         self.store: ApprovalStore = store if store is not None else MemoryApprovalStore()
+        if key is None:
+            if getattr(self.store, "persistent", True):
+                raise ConfigError("a persistent approval store needs key= (a secret kept "
+                                  "outside the store): without one, anyone who can edit the "
+                                  "store can change what an approval runs")
+            key = secrets.token_bytes(MIN_KEY_BYTES)
+        if not isinstance(key, bytes | bytearray) or len(key) < MIN_KEY_BYTES:
+            raise ConfigError(f"approval keys must be at least {MIN_KEY_BYTES} bytes")
+        self._key = bytes(key)
         self.ttl = ttl
         self.notify = notify
         self.max_pending_per_requester = max_pending_per_requester
@@ -247,17 +328,18 @@ class ApprovalQueue:
         """Queue ``action(**payload)`` for the owner. Allowed on any turn."""
         turn = current_turn()
         payload = dict(payload)
-        digest = payload_digest(action, payload)          # TypeError if not plain JSON
+        content = _content(action, payload)                 # TypeError if not plain JSON
         if len(_canonical_json(payload).encode("utf-8")) > MAX_PAYLOAD_BYTES:
             raise Refused("invalid_args", detail="approval payload too large")
         if action not in self._executors:
             raise Refused("approval_not_allowed", detail=f"no executor for {action!r}")
         now = self._clock()
-        with self._lock:
+        with self._exclusive():
             approvals = self.store.load()
             self._expire(approvals, now)
             for existing in approvals.values():
-                if existing.status is ApprovalStatus.PENDING and existing.digest == digest:
+                if (existing.status is ApprovalStatus.PENDING
+                        and _content(existing.action, existing.payload) == content):
                     self.store.save(approvals)
                     return existing
             if turn.role is Role.THIRD_PARTY:
@@ -267,11 +349,13 @@ class ApprovalQueue:
                               and a.requester == turn.sender)
                 if waiting >= self.max_pending_per_requester:
                     raise Refused("too_many_pending", detail=f"{turn.sender} has {waiting}")
+            code = self._new_code(approvals)
             approval = Approval(
-                code=self._new_code(approvals), action=action, payload=copy.deepcopy(payload),
-                digest=digest, summary=_clean_summary(summary), status=ApprovalStatus.PENDING,
-                requester_role=str(turn.role), requester=turn.sender, bound_turn=turn.turn_id,
-                created_at=now, expires_at=now + self.ttl)
+                code=code, action=action, payload=copy.deepcopy(payload),
+                digest=self._digest(code, action, payload), summary=_clean_summary(summary),
+                status=ApprovalStatus.PENDING, requester_role=str(turn.role),
+                requester=turn.sender, bound_turn=turn.turn_id, created_at=now,
+                expires_at=now + self.ttl)
             approvals[approval.code] = approval
             self._prune(approvals, now)
             self.store.save(approvals)
@@ -317,7 +401,7 @@ class ApprovalQueue:
         if turn.role is not Role.OWNER:
             return [], {}, []
         now = self._clock()
-        with self._lock:
+        with self._exclusive():
             approvals = self.store.load()
             expired = self._expire(approvals, now)
             verb, codes = parse_decision(turn.text, approvals.keys())
@@ -360,8 +444,9 @@ class ApprovalQueue:
         problem = ""
         if executor is None:
             problem = f"no executor registered for {approval.action!r}"
-        elif payload_digest(approval.action, approval.payload) != approval.digest:
-            problem = "stored payload does not match the digest that was requested"
+        elif not _same_digest(self._digest(code, approval.action, approval.payload),
+                              approval.digest):
+            problem = "stored request does not match its digest"
         if problem:
             log.warning("approval %s not executed: %s", code, problem)
             approval.status = ApprovalStatus.FAILED
@@ -387,7 +472,7 @@ class ApprovalQueue:
 
     def _finish(self, code: str, status: ApprovalStatus, *, result: Any = None,
                 error: str = "") -> None:
-        with self._lock:
+        with self._exclusive():
             approvals = self.store.load()
             current = approvals.get(code)
             if current is None:
@@ -405,7 +490,7 @@ class ApprovalQueue:
             raise Refused("owner_only", detail="only the owner can edit a request")
         payload = dict(payload)
         now = self._clock()
-        with self._lock:
+        with self._exclusive():
             approvals = self.store.load()
             self._expire(approvals, now)
             approval = approvals.get(code.upper())
@@ -414,7 +499,7 @@ class ApprovalQueue:
             del approvals[approval.code]
             approval.code = self._new_code(approvals)
             approval.payload = copy.deepcopy(payload)
-            approval.digest = payload_digest(approval.action, payload)
+            approval.digest = self._digest(approval.code, approval.action, payload)
             if summary is not None:
                 approval.summary = _clean_summary(summary)
             approval.bound_turn = turn.turn_id
@@ -426,7 +511,7 @@ class ApprovalQueue:
     def pending(self) -> list[Approval]:
         """Owner/system only: requests waiting for a decision, oldest first."""
         self._require_trusted()
-        with self._lock:
+        with self._exclusive():
             approvals = self.store.load()
             if self._expire(approvals, self._clock()):
                 self.store.save(approvals)
@@ -436,10 +521,23 @@ class ApprovalQueue:
     def get(self, code: str) -> Approval | None:
         """Owner/system only."""
         self._require_trusted()
-        with self._lock:
+        with self._exclusive():
             return self.store.load().get(code.upper())
 
     # -- internals --------------------------------------------------------------------------
+
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """One read-modify-write at a time: this queue's threads queue on its own lock, and
+        every other queue or process sharing the store on the store's lock."""
+        with self._lock, self.store.lock():
+            yield
+
+    def _digest(self, code: str, action: str, payload: Mapping[str, Any]) -> str:
+        """HMAC-SHA256 over the code, action and payload, keyed with the queue's secret."""
+        blob = _canonical_json({"code": code, "action": action, "payload": payload})
+        return hmac.new(self._key, _DIGEST_CONTEXT + blob.encode("utf-8"),
+                        hashlib.sha256).hexdigest()
 
     @staticmethod
     def _require_trusted() -> None:
@@ -485,9 +583,17 @@ def always(turn: TurnContext, taint: frozenset[str]) -> bool:
 
 
 def unless_clean_owner(turn: TurnContext, taint: frozenset[str]) -> bool:
-    """Run directly only when the owner (or system) asked and nothing untrusted was read
-    this turn; otherwise queue for approval."""
+    """Run directly only when the owner (or system) asked and nothing untrusted is in the
+    model's context; otherwise queue for approval."""
     return not (turn.is_trusted and not taint)
+
+
+def when_tainted(turn: TurnContext, taint: frozenset[str]) -> bool:
+    """Queue only when untrusted content is in the model's context (read this turn or still
+    in the conversation's history). A fit for send tools behind :func:`send_gate`: clean
+    turns send at once - a third party's reply or relay included - and a tainted turn waits
+    for the owner."""
+    return bool(taint)
 
 
 def requires_approval(queue: ApprovalQueue, action: str, *,
@@ -496,7 +602,8 @@ def requires_approval(queue: ApprovalQueue, action: str, *,
     """Route calls through ``queue`` when ``when(turn, taint)`` says so. The undecorated
     function is registered as the executor, so an approval runs exactly the call that was
     shown to the owner. Put role gates *outside* this decorator so refusals happen before
-    anything is queued."""
+    anything is queued; :func:`send_gate` also reads ``when`` to let a tainted send through
+    to the queue instead of refusing it."""
 
     def decorate(fn: Callable[..., Any]) -> Callable[..., Any]:
         sig = inspect.signature(fn)
@@ -518,6 +625,7 @@ def requires_approval(queue: ApprovalQueue, action: str, *,
                 bound = bind_arguments(sig, args, kwargs)
                 pending = maybe_queue(bound)
                 return pending if pending is not None else await fn(*bound.args, **bound.kwargs)
+            setattr(async_wrapper, APPROVAL_POLICY_ATTR, when)
             return async_wrapper
 
         @functools.wraps(fn)
@@ -525,6 +633,7 @@ def requires_approval(queue: ApprovalQueue, action: str, *,
             bound = bind_arguments(sig, args, kwargs)
             pending = maybe_queue(bound)
             return pending if pending is not None else fn(*bound.args, **bound.kwargs)
+        setattr(wrapper, APPROVAL_POLICY_ATTR, when)
         return wrapper
 
     return decorate

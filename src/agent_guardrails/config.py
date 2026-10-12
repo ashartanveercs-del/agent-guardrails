@@ -60,6 +60,13 @@ def _int(environ: Mapping[str, str], name: str, default: int, low: int, high: in
     return value
 
 
+def _key(environ: Mapping[str, str], name: str) -> bytes | None:
+    raw = environ.get(name, "")
+    if raw and len(raw.encode("utf-8")) < MIN_KEY_BYTES:
+        raise ConfigError(f"{name} must be at least {MIN_KEY_BYTES} bytes")
+    return raw.encode("utf-8") if raw else None
+
+
 @dataclass(frozen=True)
 class Settings:
     owners: OwnerIdentity
@@ -68,6 +75,7 @@ class Settings:
     min_schedule_interval: timedelta
     approval_ttl: timedelta
     envelope_key: bytes | None
+    approval_key: bytes | None = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Settings:
@@ -102,11 +110,8 @@ class Settings:
         minutes = _int(env, f"{PREFIX}MIN_INTERVAL_MINUTES", 5, 5, 24 * 60)
         hours = _int(env, f"{PREFIX}APPROVAL_TTL_HOURS", 24, 1, 168)
 
-        key = env.get(f"{PREFIX}ENVELOPE_KEY", "")
-        if key and len(key.encode("utf-8")) < MIN_KEY_BYTES:
-            raise ConfigError(f"{PREFIX}ENVELOPE_KEY must be at least {MIN_KEY_BYTES} bytes")
-
         return cls(owners=owners, timezone=timezone, tenant=tenant,
                    min_schedule_interval=timedelta(minutes=minutes),
                    approval_ttl=timedelta(hours=hours),
-                   envelope_key=key.encode("utf-8") if key else None)
+                   envelope_key=_key(env, f"{PREFIX}ENVELOPE_KEY"),
+                   approval_key=_key(env, f"{PREFIX}APPROVAL_KEY"))

@@ -4,7 +4,8 @@ import inspect
 
 import pytest
 
-from agent_guardrails.context import tainted_by, turn_scope
+from agent_guardrails.approvals import ApprovalQueue, requires_approval, unless_clean_owner
+from agent_guardrails.context import mark_untrusted, tainted_by, turn_scope
 from agent_guardrails.errors import Refused
 from agent_guardrails.gates import own_records_only, owner_only, send_gate, untrusted_output
 from agent_guardrails.identity import Envelope, OwnerIdentity, classify_turn
@@ -12,7 +13,9 @@ from tests.fakes import (
     CUSTOMER,
     OWNER_EMAIL,
     OWNER_PHONE,
+    OWNERS,
     STRANGER,
+    FakeClock,
     FakeHistory,
     FakeMailbox,
     FakeSmsApi,
@@ -20,6 +23,11 @@ from tests.fakes import (
     owner_turn,
     system_turn,
 )
+
+
+def unverified_turn(sender=CUSTOMER):
+    """A message whose sender id the adapter could not verify (it may be spoofed)."""
+    return classify_turn(Envelope("sms", sender, verified=False, text="it's me"), OWNERS)
 
 
 @pytest.fixture
@@ -207,6 +215,85 @@ def test_send_gate_rejects_a_recipient_parameter_the_function_does_not_have():
             pass
 
 
+@pytest.mark.parametrize("make_turn", [owner_turn, system_turn], ids=["owner", "system"])
+def test_a_tainted_trusted_turn_cannot_send_to_anyone_else(sms, make_turn):
+    """Once an email entered the model's context, the injected text may be choosing the
+    recipient, so the owner's (or a job's) "send anywhere" privilege is suspended."""
+    send_sms = make_send_sms(sms)
+    with turn_scope(make_turn()), pytest.raises(Refused) as err:
+        mark_untrusted("email")
+        send_sms(STRANGER, "fwd: every email in the inbox")
+    assert err.value.code == "tainted_recipient"
+    assert sms.sent == []
+
+
+@pytest.mark.parametrize("make_turn", [owner_turn, system_turn], ids=["owner", "system"])
+def test_a_tainted_turn_can_still_message_the_owner(sms, make_turn):
+    with turn_scope(make_turn()):
+        mark_untrusted("email")
+        make_send_sms(sms)(OWNER_PHONE, "Briefing: 1 new invoice")
+    assert sms.sent == [{"to": OWNER_PHONE, "body": "Briefing: 1 new invoice"}]
+
+
+def test_a_tainted_send_to_someone_else_waits_for_the_owner_when_the_tool_can_queue(sms):
+    queue = ApprovalQueue(clock=FakeClock())
+
+    @send_gate(recipient="to", channel="sms")
+    @requires_approval(queue, "sms.send", when=unless_clean_owner, summary="Text")
+    def send_sms(to: str, body: str):
+        return sms.send(to, body)
+
+    with turn_scope(owner_turn()):
+        mark_untrusted("email")
+        assert send_sms(STRANGER, "Forwarding the invoice")["status"] == "pending_approval"
+    assert sms.sent == []
+
+
+def test_an_approval_step_that_would_not_queue_does_not_open_the_gate(sms):
+    queue = ApprovalQueue(clock=FakeClock())
+
+    @send_gate(recipient="to", channel="sms")
+    @requires_approval(queue, "sms.send", when=lambda turn, taint: False, summary="Text")
+    def send_sms(to: str, body: str):
+        return sms.send(to, body)
+
+    with turn_scope(owner_turn()), pytest.raises(Refused) as err:
+        mark_untrusted("email")
+        send_sms(STRANGER, "fwd")
+    assert err.value.code == "tainted_recipient"
+    assert sms.sent == []
+
+
+async def test_the_tainted_send_rule_covers_async_tools(sms):
+    queue = ApprovalQueue(clock=FakeClock())
+
+    @send_gate(recipient="to", channel="sms")
+    async def send_now(to: str, body: str):
+        return sms.send(to, body)
+
+    @send_gate(recipient="to", channel="sms")
+    @requires_approval(queue, "sms.later", when=unless_clean_owner, summary="Text")
+    async def send_later(to: str, body: str):
+        return sms.send(to, body)
+
+    with turn_scope(system_turn()):
+        mark_untrusted("web")
+        with pytest.raises(Refused):
+            await send_now(STRANGER, "fwd")
+        assert (await send_later(STRANGER, "fwd"))["status"] == "pending_approval"
+    assert sms.sent == []
+
+
+def test_an_unverified_sender_cannot_get_texts_sent_to_the_number_it_claims(sms):
+    send_sms = make_send_sms(sms)
+    with turn_scope(unverified_turn()):
+        with pytest.raises(Refused) as err:
+            send_sms(CUSTOMER, "Your one-time code is 1234")
+        send_sms(OWNER_PHONE, "Someone says they are a customer")   # a relay is still fine
+    assert err.value.code == "recipient_not_allowed"
+    assert [m["to"] for m in sms.sent] == [OWNER_PHONE]
+
+
 def test_chat_channel_third_party_can_reply_in_its_own_namespace_only(sms):
     owners = OwnerIdentity(phones=[OWNER_PHONE], accounts={"slack": ["U0OWNER"]})
     turn = classify_turn(Envelope("slack", "U0GUEST", verified=True), owners)
@@ -264,6 +351,15 @@ def test_a_sender_without_a_usable_identity_reads_nothing():
     history = FakeHistory({"": ["?"]})
     with turn_scope(customer_turn(sender="not-a-number")), pytest.raises(Refused):
         make_history_tool(history)()
+    assert history.reads == []
+
+
+@pytest.mark.parametrize("contact", [None, CUSTOMER])
+def test_an_unverified_sender_cannot_read_the_history_of_the_number_it_claims(contact):
+    history = FakeHistory({CUSTOMER: ["Do you have Saturday hours?"]})
+    with turn_scope(unverified_turn()), pytest.raises(Refused) as err:
+        make_history_tool(history)(contact=contact)
+    assert err.value.code == "scope_violation"
     assert history.reads == []
 
 

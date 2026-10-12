@@ -60,7 +60,7 @@ def test_classify_uses_metadata_only(capsys):
     assert code == 0 and json.loads(out)["role"] == "third_party"
     code, out, _ = run(capsys, "classify", "--channel", "sms", "--sender", "+15550001111",
                        "--owner-phone", "+15550001111")
-    assert json.loads(out) == {"role": "third_party", "sender": "+15550001111",
+    assert json.loads(out) == {"role": "third_party", "sender": "",
                                "reason": "unverified envelope"}
 
 

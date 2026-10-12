@@ -14,10 +14,11 @@ from .approvals import (
     always,
     requires_approval,
     unless_clean_owner,
+    when_tainted,
 )
 from .carryforward import Backoff, BriefingPlan, Candidate, CarryForward, Status, item_key
 from .config import Settings
-from .context import current_turn, mark_untrusted, tainted_by, turn_scope
+from .context import TaintLedger, current_turn, mark_untrusted, tainted_by, turn_scope
 from .errors import ConfigError, GuardrailError, Refused, StateCorrupt
 from .gates import own_records_only, owner_only, send_gate, untrusted_output
 from .identity import Envelope, OwnerIdentity, Role, SystemOrigin, TurnContext, classify_turn
@@ -31,9 +32,9 @@ __all__ = [
     "ApprovalQueue", "ApprovalStatus", "Backoff", "BriefingPlan", "Candidate", "CarryForward",
     "ConfigError", "Envelope", "GuardrailError", "JsonApprovalStore", "McpToolServer",
     "MemoryApprovalStore", "ModelReply", "OwnerIdentity", "Refused", "Role", "Settings",
-    "StateCorrupt", "Status", "SystemOrigin", "TenantBinding", "ToolCall", "Toolbox",
-    "TurnContext", "TurnResult", "__version__", "always", "classify_turn", "current_turn",
-    "item_key", "mark_untrusted", "open_envelope", "own_records_only", "owner_only",
-    "requires_approval", "run_turn", "seal_envelope", "send_gate", "tainted_by",
-    "tenant_scoped", "turn_scope", "unless_clean_owner", "untrusted_output",
+    "StateCorrupt", "Status", "SystemOrigin", "TaintLedger", "TenantBinding", "ToolCall",
+    "Toolbox", "TurnContext", "TurnResult", "__version__", "always", "classify_turn",
+    "current_turn", "item_key", "mark_untrusted", "open_envelope", "own_records_only",
+    "owner_only", "requires_approval", "run_turn", "seal_envelope", "send_gate", "tainted_by",
+    "tenant_scoped", "turn_scope", "unless_clean_owner", "untrusted_output", "when_tainted",
 ]

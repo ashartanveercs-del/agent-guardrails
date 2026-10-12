@@ -4,8 +4,9 @@ through the toolbox only."""
 import pytest
 
 from agent_guardrails.approvals import ApprovalQueue, requires_approval
+from agent_guardrails.context import TaintLedger, tainted_by, turn_scope
 from agent_guardrails.gates import owner_only, send_gate
-from agent_guardrails.identity import Envelope, Role, SystemOrigin
+from agent_guardrails.identity import Envelope, Role, SystemOrigin, classify_turn
 from agent_guardrails.loop import ModelReply, ToolCall, run_turn
 from agent_guardrails.toolbox import Toolbox
 from tests.fakes import (
@@ -127,6 +128,45 @@ def test_the_loop_stops_after_max_steps(world):
                       model=forever, max_steps=3)
     assert len(forever.calls) == 3
     assert "couldn't finish" in result.reply
+
+
+def test_history_of_unknown_provenance_taints_an_owner_turn(world):
+    """Without a TaintLedger the loop can't know whether earlier turns read an email, and the
+    model sees that history now, so the turn is treated as tainted."""
+    model = ScriptedModel(ModelReply(tool_calls=(
+        ToolCall("send_sms", {"to": STRANGER, "body": "fwd"}, "c1"),
+        ToolCall("send_sms", {"to": OWNER_PHONE, "body": "note to self"}, "c2"))))
+    result = run_turn(inbound(OWNER_PHONE, "ok, go ahead"), owners=OWNERS,
+                      toolbox=world["box"], model=model,
+                      history=[{"role": "user", "content": "what's in my inbox?"}])
+    assert [r["output"].get("code", "ok") for r in result.tool_results] == ["tainted_recipient",
+                                                                           "ok"]
+    assert result.taint == {"history"}
+    assert world["sms"].sent == [{"to": OWNER_PHONE, "body": "note to self"}]
+
+
+def test_a_turn_without_history_starts_clean(world):
+    model = ScriptedModel(ModelReply(tool_calls=(ToolCall("send_sms", {"to": STRANGER,
+                                                                       "body": "hi"}),)))
+    result = run_turn(inbound(OWNER_PHONE, "text them hi"), owners=OWNERS, toolbox=world["box"],
+                      model=model)
+    assert result.taint == frozenset() and world["sms"].sent[0]["to"] == STRANGER
+
+
+def test_approval_decisions_are_made_before_carried_taint_applies(world):
+    """An approval is the owner's own words, parsed in code, so taint carried over from
+    earlier turns must neither stop it nor leak into what it runs."""
+    ledger, seen = TaintLedger(clock=FakeClock()), []
+    world["queue"].register("note", lambda text: seen.append(tainted_by()))
+    turn = classify_turn(inbound(OWNER_PHONE, "remind me to call the bank"), OWNERS)
+    ledger.remember(turn, {"email"})                 # this conversation read an email earlier
+    with turn_scope(turn):
+        code = world["queue"].request("note", {"text": "call the bank"}, summary="Note").code
+    result = run_turn(inbound(OWNER_PHONE, f"approve {code}"), owners=OWNERS,
+                      toolbox=world["box"], model=ScriptedModel(), approvals=world["queue"],
+                      taint_ledger=ledger)
+    assert result.decisions[0].outcome == "executed"
+    assert seen == [frozenset()]
 
 
 def test_system_turns_use_their_note_as_the_prompt(world):

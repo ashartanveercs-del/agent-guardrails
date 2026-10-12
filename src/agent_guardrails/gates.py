@@ -21,12 +21,23 @@ import inspect
 from collections.abc import Callable, Iterable
 from typing import Any, TypeVar, overload
 
-from .context import current_turn, mark_untrusted
+from .context import current_turn, mark_untrusted, tainted_by
 from .errors import Refused
 from .identity import TurnContext, canonical_address, canonical_sender, channel_kind
 
 F = TypeVar("F", bound=Callable[..., Any])
 Check = Callable[[inspect.BoundArguments], None]
+
+# Set by @requires_approval on its wrapper (and copied outwards by functools.wraps), so an
+# outer gate can tell whether a call will be queued for the owner instead of running.
+APPROVAL_POLICY_ATTR = "__guardrails_approval_policy__"
+
+
+def _queues_for_approval(func: Callable[..., Any], turn: TurnContext,
+                         taint: frozenset[str]) -> bool:
+    """Will ``func`` hand this call to an ``@requires_approval`` step that queues it?"""
+    policy = getattr(func, APPROVAL_POLICY_ATTR, None)
+    return policy is not None and bool(policy(turn, taint))
 
 
 def bind_arguments(sig: inspect.Signature, args: tuple[Any, ...],
@@ -104,8 +115,13 @@ def send_gate(*, recipient: str = "to", channel: str | None = None,
     * Every caller needs a recipient that canonicalises for the channel (an E.164 number,
       a plain email address, a platform id). Anything ambiguous is refused, because a
       provider may "helpfully" reinterpret it as someone else.
-    * Owner and system turns may then send anywhere.
-    * A third party may only message itself (a reply) or the owner (a relay).
+    * Anyone may message the turn's own verified sender (a reply) or the owner (a relay).
+    * A clean owner or system turn may message anyone else too.
+    * A *tainted* owner or system turn (an email or web page entered the model's context,
+      see :func:`untrusted_output`) may not: the injected text could be choosing the
+      recipient. The call goes ahead only if an ``@requires_approval`` step inside this
+      gate queues it for the owner; otherwise it is refused as ``tainted_recipient``.
+    * A third party may message no one else.
 
     The channel is fixed with ``channel=`` or read from the call with ``channel_param=``
     (then it must be in ``channels``). With ``normalize`` the function receives the
@@ -139,12 +155,16 @@ def send_gate(*, recipient: str = "to", channel: str | None = None,
                                                           "address")
             if normalize:
                 bound.arguments[recipient] = target
-            if turn.is_trusted:
-                return
             if _is_self(turn, chosen, target) or turn.owners.owns(chosen, target):
-                return
-            raise Refused("recipient_not_allowed",
-                          detail=f"{turn.role} {turn.sender or '?'} tried {chosen}:{target}")
+                return                                    # a reply, or a relay to the owner
+            if not turn.is_trusted:
+                raise Refused("recipient_not_allowed",
+                              detail=f"{turn.role} {turn.sender or '?'} tried {chosen}:{target}")
+            taint = tainted_by()
+            if not taint or _queues_for_approval(func, turn, taint):
+                return                                    # clean, or the owner will decide
+            raise Refused("tainted_recipient",
+                          detail=f"{turn.role} turn read {sorted(taint)}, tried {chosen}:{target}")
 
         return guarded(func, check)
 

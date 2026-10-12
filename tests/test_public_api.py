@@ -5,11 +5,11 @@ import agent_guardrails.scheduling as sched
 
 EXPECTED = {
     "Role", "Envelope", "SystemOrigin", "OwnerIdentity", "TurnContext", "classify_turn",
-    "turn_scope", "current_turn", "mark_untrusted", "tainted_by",
+    "turn_scope", "current_turn", "mark_untrusted", "tainted_by", "TaintLedger",
     "owner_only", "send_gate", "own_records_only", "untrusted_output",
     "Refused", "ConfigError", "GuardrailError", "StateCorrupt",
     "Toolbox", "ApprovalQueue", "ApprovalStatus", "MemoryApprovalStore", "JsonApprovalStore",
-    "requires_approval", "always", "unless_clean_owner",
+    "requires_approval", "always", "unless_clean_owner", "when_tainted",
     "TenantBinding", "tenant_scoped",
     "CarryForward", "Candidate", "Backoff", "Status", "item_key",
     "seal_envelope", "open_envelope", "McpToolServer",

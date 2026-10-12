@@ -2,8 +2,9 @@
 
     python scripts/mutation_check.py
 
-Each mutation edits one line of the source, runs ``pytest tests/redteam``, and restores
-the original file in a ``finally`` block. Exit code 0 means every mutation was caught.
+Each mutation edits one line (or one statement) of the source, runs the red-team, tenancy
+and approval tests, and restores the original file in a ``finally`` block. Exit code 0
+means every mutation was caught.
 """
 
 from __future__ import annotations
@@ -17,12 +18,19 @@ ROOT = Path(__file__).resolve().parent.parent
 # (what the mutation simulates, file, original text, weakened text)
 MUTATIONS = [
     ("send gate lets third parties text anyone", "src/agent_guardrails/gates.py",
-     "            if _is_self(turn, chosen, target) or turn.owners.owns(chosen, target):\n"
-     "                return\n",
-     "            return\n"),
+     "            if not turn.is_trusted:\n",
+     "            if False:\n"),
+    ("send gate ignores taint on owner and system turns", "src/agent_guardrails/gates.py",
+     "            taint = tainted_by()\n",
+     "            taint = frozenset()\n"),
     ("unverified envelopes count as verified", "src/agent_guardrails/identity.py",
-     "    if not source.verified:\n        return third_party(\"unverified envelope\")\n",
-     ""),
+     "    if not source.verified:\n",
+     "    if False:\n"),
+    ("unverified senders keep their claimed id", "src/agent_guardrails/identity.py",
+     "        return TurnContext(Role.THIRD_PARTY, channel, \"\", unverified_id, owners, "
+     "text=text,\n",
+     "        return TurnContext(Role.THIRD_PARTY, channel, sender, unverified_id, owners, "
+     "text=text,\n"),
     ("taint is ignored by the approval policy", "src/agent_guardrails/approvals.py",
      "    return not (turn.is_trusted and not taint)\n",
      "    return not turn.is_trusted\n"),
@@ -42,9 +50,27 @@ MUTATIONS = [
     ("tenant id accepted from the caller", "src/agent_guardrails/tenancy.py",
      "        if requested != own:\n",
      "        if False:\n"),
-    ("MCP taint forgotten between calls", "src/agent_guardrails/mcp.py",
-     "                mark_untrusted(source)\n",
-     "                pass\n"),
+    ("MCP taint forgotten between calls and messages", "src/agent_guardrails/mcp.py",
+     "        return self._taint.get(turn.turn_id, frozenset()) | "
+     "self.taint_ledger.carried(turn)\n",
+     "        return frozenset()\n"),
+    ("taint ledger not consulted on the next turn", "src/agent_guardrails/loop.py",
+     "        return ledger.carried(turn)\n",
+     "        return frozenset()\n"),
+    ("untracked history treated as clean", "src/agent_guardrails/loop.py",
+     "    return frozenset({UNTRACKED_HISTORY}) if history and turn.is_trusted else "
+     "frozenset()\n",
+     "    return frozenset()\n"),
+    ("decision grammar skips words it doesn't know", "src/agent_guardrails/approvals.py",
+     "            return None                        # any other word may change the meaning\n",
+     "            continue\n"),
+    ("approval digest not checked", "src/agent_guardrails/approvals.py",
+     "        elif not _same_digest(self._digest(code, approval.action, approval.payload),\n"
+     "                              approval.digest):\n",
+     "        elif False:\n"),
+    ("approval store lock skipped", "src/agent_guardrails/approvals.py",
+     "        with self._lock, self.store.lock():\n",
+     "        with self._lock:\n"),
 ]
 
 
@@ -65,7 +91,7 @@ def main() -> int:
             path.write_bytes(mutated.encode("utf-8"))
             proc = subprocess.run(  # noqa: S603 - fixed argv: this interpreter running pytest
                 [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
-                 "tests/redteam", "tests/test_tenancy.py"],
+                 "tests/redteam", "tests/test_tenancy.py", "tests/test_approvals.py"],
                 cwd=ROOT, capture_output=True, text=True, timeout=600, check=False)
         finally:
             path.write_bytes(raw)

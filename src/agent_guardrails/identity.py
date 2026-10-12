@@ -9,6 +9,8 @@ Three roles:
 
 * ``OWNER``       - a verified sender that matches the configured owner identity exactly.
 * ``THIRD_PARTY`` - everyone else, including anything malformed, unverified or missing.
+                    An unverified sender id may be spoofed, so it isn't kept at all: the
+                    turn's ``sender`` is empty and can't unlock anything scoped to "yourself".
 * ``SYSTEM``      - trusted in-process automation (a scheduled job). It must be asserted
                     explicitly with :class:`SystemOrigin`; it is never the result of
                     *omitting* something, so a forgotten envelope can't escalate.
@@ -109,7 +111,8 @@ class Envelope:
     ``sender`` must be in the platform's canonical form: E.164 for phone channels (add the
     ``+`` for providers that omit it), a bare address for email, the user id otherwise.
     ``verified`` is the adapter's statement that the sender is authentic; anything
-    unverified is treated as a third party, even if it carries the owner's number.
+    unverified is treated as a third party with no sender identity at all, even if it
+    carries the owner's (or a customer's) number.
     """
 
     channel: str
@@ -248,16 +251,21 @@ def classify_turn(source: Envelope | SystemOrigin | None, owners: OwnerIdentity)
         return TurnContext(Role.THIRD_PARTY, "", "", _turn_id("", "", ""), owners,
                            text=text, reason=reason)
     sender = canonical_sender(channel, source.sender)
+    if not sender:
+        return TurnContext(Role.THIRD_PARTY, channel, "", _turn_id(channel, "", source.message_id),
+                           owners, text=text, reason="malformed sender")
+    if not source.verified:
+        # The claimed id may be spoofed, so it grants nothing: no "own records", no replies
+        # to it, no pending-request quota of its own. It only keeps the turn id distinct.
+        unverified_id = _turn_id(channel, f"unverified:{sender}", source.message_id)
+        return TurnContext(Role.THIRD_PARTY, channel, "", unverified_id, owners, text=text,
+                           reason="unverified envelope")
     turn_id = _turn_id(channel, sender, source.message_id)
 
     def third_party(reason: str) -> TurnContext:
         return TurnContext(Role.THIRD_PARTY, channel, sender, turn_id, owners, text=text,
                            reason=reason)
 
-    if not sender:
-        return third_party("malformed sender")
-    if not source.verified:
-        return third_party("unverified envelope")
     if not owners.configured:
         return third_party("no owner configured")
     owner_id = sender if channel_kind(channel) != "account" else sender.split(":", 1)[1]

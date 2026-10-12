@@ -143,9 +143,10 @@ def test_json_rpc_errors(server):
     assert rpc(server, "ping")["result"] == {}
 
 
-def test_taint_follows_the_turn_across_separate_calls(clock):
-    """Each tools/call is its own request, but calls from one inbound message are one turn:
-    reading an email in call 1 must still count when call 2 tries to send."""
+def test_taint_follows_the_turn_and_the_conversation_across_separate_calls(clock):
+    """Each tools/call is its own request, but calls from one inbound message are one turn,
+    and the gateway replays that turn as history for the sender's next message: reading a page
+    in call 1 still counts when a later call, or a later message, tries to send."""
     box = Toolbox()
 
     @box.tool(description="Read an untrusted page.")
@@ -159,14 +160,19 @@ def test_taint_follows_the_turn_across_separate_calls(clock):
 
     server = McpToolServer(box, OWNERS, envelope_key=KEY, clock=clock)
 
-    def sealed(message_id):
-        return {ENVELOPE_META_KEY: seal_envelope(
-            Envelope("sms", OWNER_PHONE, verified=True, message_id=message_id), KEY,
+    def taint_seen(message_id, channel="sms", sender=OWNER_PHONE):
+        sealed = {ENVELOPE_META_KEY: seal_envelope(
+            Envelope(channel, sender, verified=True, message_id=message_id), KEY,
             now=clock())}
+        return call(server, "taint", {}, sealed)["structuredContent"]["result"]
 
-    call(server, "fetch_page", {}, sealed("SM1"))
-    assert call(server, "taint", {}, sealed("SM1"))["structuredContent"]["result"] == ["web"]
-    assert call(server, "taint", {}, sealed("SM2"))["structuredContent"]["result"] == []
+    call(server, "fetch_page", {}, {ENVELOPE_META_KEY: seal_envelope(
+        Envelope("sms", OWNER_PHONE, verified=True, message_id="SM1"), KEY, now=clock())})
+    assert taint_seen("SM1") == ["web"]                                  # the same turn
+    assert taint_seen("SM2") == ["web"]                                  # the next message
+    assert taint_seen("EM1", "email", "owner@example.com") == []         # another conversation
+    clock.advance(hours=25)
+    assert taint_seen("SM3") == []                                       # past the ledger's ttl
 
 
 def test_the_envelope_age_limit_is_configurable(fakes, clock):

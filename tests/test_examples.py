@@ -20,6 +20,7 @@ def test_plain_agent_loop_demo():
     out = proc.stdout
     assert "recipient_not_allowed" in out and "unknown_tool" in out     # injection refused
     assert "pending_approval" in out and "Done (" in out                 # approval round trip
+    assert "refused: tainted_recipient" in out                           # the email's P.S.
     assert "every weekday at 7:30 AM (America/New_York)" in out          # scheduling echo
     assert "ran as system" in out                                        # job fired
     assert "SIDE EFFECTS FROM THE ATTACK: none" in out

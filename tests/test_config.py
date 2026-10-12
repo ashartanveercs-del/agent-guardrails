@@ -16,6 +16,7 @@ FULL = {
     "GUARDRAILS_MIN_INTERVAL_MINUTES": "15",
     "GUARDRAILS_APPROVAL_TTL_HOURS": "4",
     "GUARDRAILS_ENVELOPE_KEY": "x" * 40,
+    "GUARDRAILS_APPROVAL_KEY": "a" * 40,
 }
 
 
@@ -29,6 +30,7 @@ def test_full_configuration():
     assert s.min_schedule_interval == timedelta(minutes=15)
     assert s.approval_ttl == timedelta(hours=4)
     assert s.envelope_key == b"x" * 40
+    assert s.approval_key == b"a" * 40
 
 
 def test_defaults_are_conservative():
@@ -39,6 +41,7 @@ def test_defaults_are_conservative():
     assert s.min_schedule_interval == timedelta(minutes=5)
     assert s.approval_ttl == timedelta(hours=24)
     assert s.envelope_key is None
+    assert s.approval_key is None
 
 
 @pytest.mark.parametrize("name,value", [
@@ -76,9 +79,10 @@ def test_a_malformed_env_file_line_is_an_error_naming_the_line(tmp_path):
         read_env_file(path)
 
 
-def test_a_short_envelope_key_is_refused_without_echoing_it():
+@pytest.mark.parametrize("name", ["GUARDRAILS_ENVELOPE_KEY", "GUARDRAILS_APPROVAL_KEY"])
+def test_a_short_key_is_refused_without_echoing_it(name):
     secret = "tooshort-secret"
     with pytest.raises(ConfigError) as err:
-        Settings.from_env({"GUARDRAILS_ENVELOPE_KEY": secret})
-    assert "GUARDRAILS_ENVELOPE_KEY" in str(err.value)
+        Settings.from_env({name: secret})
+    assert name in str(err.value)
     assert secret not in str(err.value)

@@ -1,6 +1,14 @@
 """Approval queue: anyone may ask, only the verified owner can decide, and only in code."""
 
+import contextlib
+import hashlib
+import json
+import subprocess
+import sys
+import threading
+import time
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -13,13 +21,16 @@ from agent_guardrails.approvals import (
     parse_decision,
     requires_approval,
     unless_clean_owner,
+    when_tainted,
 )
 from agent_guardrails.context import mark_untrusted, turn_scope
-from agent_guardrails.errors import Refused
+from agent_guardrails.errors import ConfigError, Refused
 from agent_guardrails.gates import send_gate
+from agent_guardrails.identity import Envelope, classify_turn
 from tests.fakes import (
     CUSTOMER,
     OWNER_PHONE,
+    OWNERS,
     STRANGER,
     FakeClock,
     FakeSmsApi,
@@ -27,6 +38,13 @@ from tests.fakes import (
     owner_turn,
     system_turn,
 )
+
+KEY = b"k" * 32          # the queue's signing secret; never stored with the requests
+WORKER = Path(__file__).with_name("approval_worker.py")
+
+
+def unverified_turn(sender):
+    return classify_turn(Envelope("sms", sender, verified=False, text="call me"), OWNERS)
 
 
 @pytest.fixture
@@ -94,6 +112,16 @@ def test_a_third_party_cannot_flood_the_owner(queue):
         ask(queue, body=f"owner request {i}")
 
 
+def test_unverified_senders_share_one_pending_cap(queue, notified):
+    """Rotating the claimed (spoofable) number must not buy a fresh quota of owner alerts."""
+    for i in range(3):
+        ask(queue, unverified_turn(f"+1555000{3000 + i}"), to=OWNER_PHONE, body=f"call me #{i}")
+    with pytest.raises(Refused) as err:
+        ask(queue, unverified_turn("+15550003999"), to=OWNER_PHONE, body="call me #4")
+    assert err.value.code == "too_many_pending"
+    assert len(notified) == 3
+
+
 def test_payloads_must_be_plain_json(queue):
     with turn_scope(owner_turn()), pytest.raises(TypeError):
         queue.request("sms.send", {"to": STRANGER, "body": object()}, summary="x")
@@ -110,9 +138,9 @@ def test_owner_approval_executes_exactly_once(queue, sms):
     assert sms.sent == [{"to": STRANGER, "body": "Invoice attached"}]
 
 
-def test_codes_are_case_insensitive_and_position_free(queue, sms):
+def test_codes_are_case_insensitive_and_may_come_before_the_verb(queue, sms):
     code = ask(queue).code
-    owner_says(queue, f"{code.lower()} ok, go ahead")
+    owner_says(queue, f"{code.lower()} ok!")
     assert len(sms.sent) == 1
 
 
@@ -138,6 +166,30 @@ def test_hedged_or_contradictory_replies_do_nothing(queue, sms, text):
     code = ask(queue).code
     [decision] = owner_says(queue, text.format(code=code))
     assert decision.outcome == "ambiguous"
+    assert sms.sent == []
+
+
+@pytest.mark.parametrize("text", [
+    "never send {code}",
+    "don’t send {code}",           # the apostrophe iOS and macOS type by default
+    "Please don’t do {code}",
+    "don't send {code}",
+    "dont go ahead with {code}",
+    "send {code} to the trash",
+    "nope, don't send {code}",
+    "nah {code} can wait",
+    "hold off on {code}",
+    "wait on {code}",
+    "approve {code} tomorrow",
+    "ok but not {code}",
+    "{code}: no way",
+])
+def test_a_refusal_is_never_read_as_an_approval(queue, sms, text):
+    """Negation can't be listed exhaustively ("never", "nope", "send it to the trash"), so
+    only an exact verb + code approves, and everything else does nothing."""
+    code = ask(queue).code
+    [decision] = owner_says(queue, text.format(code=code))
+    assert decision.outcome in ("ambiguous", "rejected")
     assert sms.sent == []
 
 
@@ -198,6 +250,38 @@ def test_a_tampered_payload_is_never_executed(queue, sms):
     assert sms.sent == []
 
 
+def unkeyed_digest(action, payload):
+    """What anyone can compute from the stored request with the published format."""
+    blob = json.dumps({"action": action, "payload": payload}, sort_keys=True,
+                      separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def test_a_payload_rewritten_with_a_recomputed_digest_is_never_executed(queue, sms):
+    """Someone who can edit the store can also recompute any digest that doesn't need a
+    secret, so the digest has to be keyed."""
+    code = ask(queue).code
+    stored = queue.store.load()
+    stored[code].payload["to"] = "+15550009999"
+    stored[code].digest = unkeyed_digest(stored[code].action, stored[code].payload)
+    queue.store.save(stored)
+    [decision] = owner_says(queue, f"approve {code}")
+    assert decision.outcome == "failed"
+    assert sms.sent == []
+
+
+def test_a_payload_cannot_be_moved_onto_another_code(queue, sms):
+    """The owner approves the request they were shown under that code, never another one."""
+    shown = ask(queue, body="Quote attached").code
+    other = ask(queue, to="+15550009999", body="Gift card numbers").code
+    stored = queue.store.load()
+    stored[shown].payload, stored[shown].digest = stored[other].payload, stored[other].digest
+    queue.store.save(stored)
+    [decision] = owner_says(queue, f"approve {shown}")
+    assert decision.outcome == "failed"
+    assert sms.sent == []
+
+
 def test_editing_rotates_the_code_so_old_approvals_cannot_apply(queue, sms):
     old = ask(queue).code
     with turn_scope(owner_turn("change the wording")):
@@ -229,14 +313,110 @@ def test_new_codes_never_collide_with_existing_ones(clock, sms):
 
 def test_requests_survive_a_restart(tmp_path, clock, sms):
     path = tmp_path / "approvals.json"
-    first = ApprovalQueue(JsonApprovalStore(path), clock=clock)
+    first = ApprovalQueue(JsonApprovalStore(path), key=KEY, clock=clock)
     first.register("sms.send", lambda to, body: sms.send(to, body))
     code = ask(first).code
 
-    restarted = ApprovalQueue(JsonApprovalStore(path), clock=clock)
+    restarted = ApprovalQueue(JsonApprovalStore(path), key=KEY, clock=clock)
     restarted.register("sms.send", lambda to, body: sms.send(to, body))
     assert owner_says(restarted, f"approve {code}")[0].outcome == "executed"
     assert len(sms.sent) == 1
+
+
+def test_a_persistent_store_needs_a_long_secret_key(tmp_path):
+    with pytest.raises(ConfigError, match="key"):
+        ApprovalQueue(JsonApprovalStore(tmp_path / "approvals.json"))
+    with pytest.raises(ConfigError, match="32 bytes"):
+        ApprovalQueue(JsonApprovalStore(tmp_path / "approvals.json"), key=b"short")
+
+
+def test_editing_the_approvals_file_cannot_change_what_runs(tmp_path, clock, sms):
+    """The reported attack: rewrite the recipient in approvals.json and recompute the digest.
+    Without the queue's key the new digest can't be right, so nothing runs."""
+    path = tmp_path / "approvals.json"
+    queue = ApprovalQueue(JsonApprovalStore(path), key=KEY, clock=clock)
+    queue.register("sms.send", lambda to, body: sms.send(to, body))
+    code = ask(queue, to="+15550004444", body="Quote attached").code
+    data = json.loads(path.read_text(encoding="utf-8"))
+    [stored] = data["approvals"]
+    stored["payload"]["to"] = "+15550009999"
+    stored["digest"] = unkeyed_digest(stored["action"], stored["payload"])
+    path.write_text(json.dumps(data), encoding="utf-8")
+    [decision] = owner_says(queue, f"approve {code}")
+    assert decision.outcome == "failed"
+    assert sms.sent == []
+
+
+def test_requests_signed_with_another_key_never_run(tmp_path, clock, sms):
+    path = tmp_path / "approvals.json"
+    first = ApprovalQueue(JsonApprovalStore(path), key=KEY, clock=clock)
+    first.register("sms.send", lambda to, body: sms.send(to, body))
+    code = ask(first).code
+    rotated = ApprovalQueue(JsonApprovalStore(path), key=b"r" * 32, clock=clock)
+    rotated.register("sms.send", lambda to, body: sms.send(to, body))
+    assert owner_says(rotated, f"approve {code}")[0].outcome == "failed"
+    assert sms.sent == []
+
+
+def test_two_workers_sharing_a_store_run_an_approval_at_most_once(tmp_path, clock,
+                                                                  monkeypatch):
+    """At most once has to hold across worker processes, not just across one queue's threads.
+    Two queues over one file stand in for two workers: each has its own store object and file
+    handle. A barrier makes both hold what they read before either saves - unless the store
+    keeps the whole read-modify-write to one worker at a time."""
+    path = tmp_path / "approvals.json"
+    executed, errors = [], []
+
+    def worker_queue():
+        q = ApprovalQueue(JsonApprovalStore(path), key=KEY, clock=clock)
+        q.register("sms.send", lambda to, body: executed.append(to))
+        return q
+
+    first, second = worker_queue(), worker_queue()
+    code = ask(first).code
+    barrier, original_load = threading.Barrier(2, timeout=1), JsonApprovalStore.load
+
+    def racing_load(self):
+        approvals = original_load(self)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        return approvals
+
+    monkeypatch.setattr(JsonApprovalStore, "load", racing_load)
+
+    def decide(queue):
+        try:
+            owner_says(queue, f"approve {code}")
+        except Exception as exc:          # e.g. PermissionError from a concurrent replace
+            errors.append(exc)
+
+    threads = [threading.Thread(target=decide, args=(q,)) for q in (first, second)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert errors == []
+    assert executed == [STRANGER]
+
+
+def test_worker_processes_sharing_a_store_run_an_approval_once(tmp_path):
+    """The same guarantee with real processes, all deciding at the same moment."""
+    store, log = tmp_path / "approvals.json", tmp_path / "executions.log"
+    queue = ApprovalQueue(JsonApprovalStore(store), key=KEY)
+    queue.register("sms.send", lambda to, body: None)
+    code = ask(queue).code
+    start_at = time.time() + 2
+    argv = [sys.executable, str(WORKER), str(store), str(log), code, str(start_at)]
+    workers = [subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for _ in range(3)]
+    outcomes = []
+    for worker in workers:
+        out, err = worker.communicate(timeout=60)
+        assert worker.returncode == 0, err
+        outcomes.append(out.strip())
+    assert sorted(outcomes)[-1] == "executed"
+    assert all(o.startswith("already_") for o in sorted(outcomes)[:-1]), outcomes
+    assert log.read_text(encoding="utf-8").splitlines() == [STRANGER]
 
 
 async def test_async_executors_run_through_adecide(clock, sms):
@@ -256,12 +436,31 @@ async def test_async_executors_run_through_adecide(clock, sms):
 
 @pytest.mark.parametrize("text,expected", [
     ("approve AB23", ("approve", ["AB23"])),
-    ("AB23 yes please", ("approve", ["AB23"])),
+    ("  Approve ab23. ", ("approve", ["AB23"])),
+    ("yes AB23!", ("approve", ["AB23"])),
+    ("AB23 ok", ("approve", ["AB23"])),                     # the code may come first
+    ("'approve AB23'", ("approve", ["AB23"])),              # pasted with the prompt's quotes
+    ("approve AB23 and CD34", ("approve", ["AB23", "CD34"])),
+    ("approve: AB23, CD34", ("approve", ["AB23", "CD34"])),
     ("reject ab23 and CD34", ("reject", ["AB23", "CD34"])),
+    ("no AB23", ("reject", ["AB23"])),
+    ("never AB23", ("reject", ["AB23"])),
     ("don't AB23", ("reject", ["AB23"])),
+    ("don’t AB23", ("reject", ["AB23"])),              # smart apostrophe
+    ("AB23 yes please", (None, ["AB23"])),                  # anything beyond verb + codes
+    ("never send AB23", (None, ["AB23"])),
+    ("don’t send AB23", (None, ["AB23"])),
+    ("send AB23 to the trash", (None, ["AB23"])),
     ("approve AB23, reject CD34", (None, ["AB23", "CD34"])),
+    ("approve AB23 approve", (None, ["AB23"])),
+    ("AB23 approve CD34", (None, ["AB23", "CD34"])),         # the verb leads or trails
+    ("approve and AB23", (None, ["AB23"])),
+    ("approve AB23?", (None, ["AB23"])),
+    ("approve AB23 \U0001f44d", (None, ["AB23"])),
+    ("approve AB23 ZZ99", (None, ["AB23"])),                 # an unknown code is an extra word
     ("hmm AB23", (None, ["AB23"])),
     ("approve ZZ99", (None, [])),
+    ("", (None, [])),
 ])
 def test_parse_decision(text, expected):
     assert parse_decision(text, {"AB23", "CD34"}) == expected
@@ -297,6 +496,18 @@ def test_unless_clean_owner_runs_directly_only_for_a_clean_owner_turn(queue, sms
     with turn_scope(customer_turn()):
         assert send_sms(OWNER_PHONE, "relay")["status"] == "pending_approval"
     assert [m["body"] for m in sms.sent] == ["direct"]
+
+
+def test_when_tainted_queues_only_what_a_tainted_turn_asks_for(queue, sms):
+    send_sms = make_send(queue, sms, when=when_tainted)
+    with turn_scope(customer_turn()):
+        assert send_sms(CUSTOMER, "See you Saturday")["to"] == CUSTOMER     # a plain reply
+    with turn_scope(owner_turn()):
+        assert send_sms(STRANGER, "Running late")["to"] == STRANGER
+    with turn_scope(owner_turn()):
+        mark_untrusted("email")
+        assert send_sms(STRANGER, "fwd: the invoice")["status"] == "pending_approval"
+    assert [m["body"] for m in sms.sent] == ["See you Saturday", "Running late"]
 
 
 def test_role_gates_still_run_before_anything_is_queued(queue, sms, notified):

@@ -10,6 +10,8 @@ PUBLIC_MESSAGES: dict[str, str] = {
     "no_active_turn": "That isn't available right now.",
     "owner_only": "That isn't available on this conversation.",
     "recipient_not_allowed": "I can only send messages to you or to the owner.",
+    "tainted_recipient": "This conversation includes outside content (such as an email), so "
+                         "for now I can only send messages to the owner.",
     "invalid_recipient": "That recipient doesn't look valid. Use a full international "
                          "number (+country code) or a plain email address.",
     "scope_violation": "I can only look up your own conversation.",

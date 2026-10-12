@@ -11,9 +11,11 @@ envelope classifies as a third party, so the worst a broken integration can do i
 the server *more* restrictive.
 
 Every ``tools/call`` is a separate request, but the calls made while handling one inbound
-message belong to one turn. Taint is therefore remembered per turn id (built from the
-sealed platform message id), so reading an email in one call still counts when a later
-call in the same turn tries to send. Gateways should always set ``message_id``.
+message belong to one turn, and the gateway replays that turn as history for the sender's
+next message. Taint is therefore remembered per turn id (built from the sealed platform
+message id, so gateways should always set ``message_id``) and, for owner and system
+conversations, in a :class:`~agent_guardrails.context.TaintLedger`: reading an email in one
+call still counts when a later call, or a later message, tries to send.
 
 Implemented methods: ``initialize``, ``ping``, ``tools/list``, ``tools/call``.
 """
@@ -28,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ._version import __version__
-from .context import mark_untrusted, tainted_by, turn_scope
+from .context import TaintLedger, tainted_by, turn_scope
 from .errors import ConfigError
 from .identity import OwnerIdentity, TurnContext, classify_turn
 from .sealing import MIN_KEY_BYTES, open_envelope
@@ -53,7 +55,10 @@ class McpToolServer:
     def __init__(self, toolbox: Toolbox, owners: OwnerIdentity, *, envelope_key: bytes,
                  clock: Callable[[], datetime] | None = None,
                  max_envelope_age: timedelta = timedelta(minutes=5),
-                 name: str = "agent-guardrails") -> None:
+                 name: str = "agent-guardrails",
+                 taint_ledger: TaintLedger | None = None) -> None:
+        """``taint_ledger`` defaults to a fresh in-memory :class:`TaintLedger` (24 h ttl);
+        pass your own to match how long your gateway keeps conversation history."""
         if not isinstance(envelope_key, bytes | bytearray) or len(envelope_key) < MIN_KEY_BYTES:
             raise ConfigError(f"the envelope key must be at least {MIN_KEY_BYTES} bytes")
         self.toolbox = toolbox
@@ -62,7 +67,10 @@ class McpToolServer:
         self._key = bytes(envelope_key)
         self._clock = clock or (lambda: datetime.now(UTC))
         self._max_age = max_envelope_age
-        # Taint per turn: separate tools/call requests from one inbound message share it.
+        self.taint_ledger = (taint_ledger if taint_ledger is not None
+                             else TaintLedger(clock=self._clock))
+        # Taint per turn, for every role: separate tools/call requests from one inbound
+        # message share it. The ledger carries owner and system taint into later messages.
         self._taint: OrderedDict[str, frozenset[str]] = OrderedDict()
 
     def turn_for(self, params: object) -> TurnContext:
@@ -121,24 +129,27 @@ class McpToolServer:
     def _call(self, params: Mapping[str, Any], name: str,
               arguments: Mapping[str, Any]) -> dict[str, Any]:
         turn = self.turn_for(params)
-        with turn_scope(turn):
-            for source in self._taint.get(turn.turn_id, frozenset()):
-                mark_untrusted(source)
+        with turn_scope(turn, taint=self._carried_taint(turn)):
             try:
                 outcome = self.toolbox.call(name, dict(arguments))
             except Exception:
                 log.exception("tool %s could not be called", name)
                 outcome = dict(TOOL_ERROR)
-            self._remember_taint(turn.turn_id, tainted_by())
+            self._remember_taint(turn, tainted_by())
         return {"content": [{"type": "text", "text": json.dumps(outcome, default=str)}],
                 "structuredContent": outcome, "isError": not outcome.get("ok", False)}
 
-    def _remember_taint(self, turn_id: str, taint: frozenset[str]) -> None:
+    def _carried_taint(self, turn: TurnContext) -> frozenset[str]:
+        """What earlier calls of this turn, and earlier turns of this conversation, read."""
+        return self._taint.get(turn.turn_id, frozenset()) | self.taint_ledger.carried(turn)
+
+    def _remember_taint(self, turn: TurnContext, taint: frozenset[str]) -> None:
         """Turn ids come from the sealed platform message id, so every call made while
         handling one inbound message shares its taint. Bounded, oldest evicted first."""
         if not taint:
             return
-        self._taint[turn_id] = taint
-        self._taint.move_to_end(turn_id)
+        self.taint_ledger.remember(turn, taint)
+        self._taint[turn.turn_id] = taint
+        self._taint.move_to_end(turn.turn_id)
         while len(self._taint) > MAX_TRACKED_TURNS:
             self._taint.popitem(last=False)
