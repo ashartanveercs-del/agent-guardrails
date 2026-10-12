@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-guardrails"
+dynamic = ["version"]
+description = "Deterministic guardrails for tool-using AI agents: turn classification from verified channel metadata, read/send gates enforced in code, safe scheduling, approval queues and prompt-injection red-team tests."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Ashar Tanveer" }]
+keywords = ["llm-agents", "guardrails", "prompt-injection", "tool-calling", "mcp", "security"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security",
+]
+dependencies = [
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+agent-guardrails = "agent_guardrails.__main__:main"
+
+[tool.hatch.version]
+path = "src/agent_guardrails/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_guardrails"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# tests use assert, subprocess with sys.executable and throwaway secrets by design
+"tests/*" = ["S101", "S603", "S105", "S106"]
+"examples/*" = ["S105", "S106"]
