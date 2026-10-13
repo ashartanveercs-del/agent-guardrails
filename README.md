@@ -376,6 +376,11 @@ python scripts/mutation_check.py    # 16 guards weakened one at a time; all must
 - Per-tool rate limits and a JSONL / OpenTelemetry audit sink for `Toolbox.audit`
 - More natural-language coverage ("the 15th" without a month, other languages)
 
+## Secret scanning
+
+[Full-history audit and secret-scan CI](docs/SECURITY-AUDIT.md). Configuration examples and
+synthetic fixtures were reviewed before publication; new credential findings fail the gate.
+
 ## License
 
 MIT
