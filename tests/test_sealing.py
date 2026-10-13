@@ -55,6 +55,12 @@ def test_garbage_does_not_open(token):
     assert open_envelope(token, KEY, now=NOW) is None
 
 
+@pytest.mark.parametrize("signature", ["\u00e9", "\uff21" * 43, "\ud800"])
+def test_non_ascii_signatures_do_not_crash(signature):
+    prefix, body, _ = seal_envelope(ENV, KEY, now=NOW).split(".")
+    assert open_envelope(f"{prefix}.{body}.{signature}", KEY, now=NOW) is None
+
+
 @pytest.mark.parametrize("iat", [10 ** 20, -10 ** 10, 2 ** 40])   # Overflow / OSError on Windows
 def test_a_validly_signed_but_absurd_timestamp_does_not_crash(iat):
     body = base64.urlsafe_b64encode(json.dumps(

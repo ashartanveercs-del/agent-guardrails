@@ -9,8 +9,10 @@ means every mutation was caught.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
+from importlib.util import cache_from_source
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +77,16 @@ MUTATIONS = [
 
 
 def main() -> int:
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    argv = [sys.executable, "-B", "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
+            "tests/redteam", "tests/test_tenancy.py", "tests/test_approvals.py"]
+    baseline = subprocess.run(  # noqa: S603 - fixed argv: this interpreter running pytest
+        argv, cwd=ROOT, env=env, capture_output=True, text=True, timeout=600, check=False)
+    if baseline.returncode != 0:
+        print("[ERROR ] clean baseline failed; no mutations attempted")
+        print(baseline.stdout + baseline.stderr)
+        return 1
+    print("[BASELINE] clean suite passed")
     missed = 0
     for label, relative, original, weakened in MUTATIONS:
         path = ROOT / relative
@@ -89,16 +101,20 @@ def main() -> int:
         try:
             mutated = text.replace(original, weakened, 1).replace("\n", newline)
             path.write_bytes(mutated.encode("utf-8"))
+            # -B prevents writes, but still reads existing bytecode. Remove this module's
+            # cache so a same-size edit within one timestamp tick cannot be hidden by it.
+            Path(cache_from_source(str(path))).unlink(missing_ok=True)
             proc = subprocess.run(  # noqa: S603 - fixed argv: this interpreter running pytest
-                [sys.executable, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider",
-                 "tests/redteam", "tests/test_tenancy.py", "tests/test_approvals.py"],
-                cwd=ROOT, capture_output=True, text=True, timeout=600, check=False)
+                argv, cwd=ROOT, env=env, capture_output=True, text=True, timeout=600, check=False)
         finally:
             path.write_bytes(raw)
-        caught = proc.returncode != 0
-        missed += not caught
         first = next((ln for ln in proc.stdout.splitlines() if ln.startswith("FAILED")), "")
-        print(f"[{'CAUGHT' if caught else 'MISSED'}] {label}\n          {first[7:110]}")
+        caught = proc.returncode == 1 and bool(first)
+        missed += not caught
+        status = "CAUGHT" if caught else "MISSED" if proc.returncode == 0 else "ERROR "
+        print(f"[{status}] {label}\n          {first[7:110]}")
+        if status == "ERROR ":
+            print(f"          pytest exit {proc.returncode}: no test-failure evidence")
     print(f"\n{len(MUTATIONS) - missed}/{len(MUTATIONS)} mutations caught")
     return 1 if missed else 0
 

@@ -23,3 +23,9 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check src tests examples scripts
       - run: pytest -q
+      - name: Offline agent loop and stdio tool-server demos
+        run: |
+          python examples/plain_agent_loop.py
+          python examples/mcp_client_demo.py
+      - name: Mutation evidence requires a green baseline and real test failures
+        run: python scripts/mutation_check.py

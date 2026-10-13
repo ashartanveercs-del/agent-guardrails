@@ -69,6 +69,8 @@ def open_envelope(token: object, key: bytes, *, now: datetime | None = None,
     if len(parts) != 3 or parts[0] != PREFIX:
         return None
     body, signature = parts[1], parts[2]
+    if not signature.isascii():
+        return None  # compare_digest accepts only ASCII strings; malformed metadata denies
     try:
         expected = _mac(key, body)
     except UnicodeEncodeError:
